@@ -1,112 +1,131 @@
 import discord
 from discord.ext import commands
+from discord.ui import View
 import sqlite3
+import aiohttp
 from config import TOKEN
 
-conn = sqlite3.connect("kariyer.db")
-cursor = conn.cursor()
-
-intents = discord.Intents.default()
-intents.message_content = True
+intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="*", intents=intents)
 
-def meslek_belirle(yas, alan, ilgi, teknoloji):
-    ilgi = ilgi.lower()
-    if alan == "sayisal" and teknoloji == "evet":
-        if "oyun" in ilgi:
-            return "Oyun Geliştirici"
-        if "çizim" in ilgi or "tasarım" in ilgi:
-            return "UI/UX Tasarımcı"
-        return "Yazılım Geliştirici"
-    if alan == "sayisal" and teknoloji == "hayir":
-        return "Matematik Öğretmeni"
-    if alan == "sozel" and teknoloji == "evet":
-        if "yazı" in ilgi or "edit" in ilgi:
-            return "İçerik Üretici"
-        return "Dijital Pazarlama Uzmanı"
-    if alan == "sozel" and teknoloji == "hayir":
-        if "konuşmak" in ilgi or "insan" in ilgi:
-            return "Psikolog veya Danışman"
-        return "Öğretmen"
-    return "İnsan Kaynakları Uzmanı"
+conn = sqlite3.connect("meslekler.db")
+cursor = conn.cursor()
 
+user_answers = {}
 
-class AlanButon(discord.ui.View):
-    def __init__(self, user):
-        super().__init__(timeout=60)
-        self.user = user
-        self.value = None
+async def ollama_sor(prompt):
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llama3.2",
+                "prompt": prompt,
+                "stream": False
+            }
+        ) as r:
+            data = await r.json()
+            cevap = data.get("response", "").strip()
+            if not cevap:
+                return "Yapay zeka şu an cevap üretemedi."
+            return cevap[:1800]
 
-    async def interaction_check(self, interaction):
-        return interaction.user == self.user
+class StartView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
 
-    @discord.ui.button(label="Sayısal", style=discord.ButtonStyle.primary)
-    async def sayisal(self, interaction, button):
-        self.value = "sayisal"
-        self.stop()
+    @discord.ui.button(label="Başla", style=discord.ButtonStyle.primary)
+    async def basla(self, interaction: discord.Interaction, button):
+        await interaction.response.defer(ephemeral=True)
+        user_answers[interaction.user.id] = {}
+        await interaction.followup.send(
+            "Hangi alandasın?",
+            view=AlanView(),
+            ephemeral=True
+        )
+
+class AlanView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Sayısal", style=discord.ButtonStyle.secondary)
+    async def sayisal(self, interaction: discord.Interaction, button):
+        await self.handle(interaction, "Sayısal")
+
+    @discord.ui.button(label="Sözel", style=discord.ButtonStyle.secondary)
+    async def sozel(self, interaction: discord.Interaction, button):
+        await self.handle(interaction, "Sözel")
+
+    async def handle(self, interaction, alan):
+        await interaction.response.defer(ephemeral=True)
+
+        user_answers[interaction.user.id]["alan"] = alan
+
+        await interaction.followup.send(
+            "En çok ilgilendiğin alanı yaz.",
+            ephemeral=True
+        )
+
+        msg = await bot.wait_for(
+            "message",
+            check=lambda m: m.author.id == interaction.user.id
+        )
+
+        user_answers[interaction.user.id]["ilgi"] = msg.content
+
+        await interaction.followup.send(
+            "Teknolojiyle ilgileniyor musun?",
+            view=TeknolojiView(),
+            ephemeral=True
+        )
+
+class TeknolojiView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Evet", style=discord.ButtonStyle.success)
+    async def evet(self, interaction: discord.Interaction, button):
+        await self.finish(interaction, "Evet")
+
+    @discord.ui.button(label="Hayır", style=discord.ButtonStyle.danger)
+    async def hayir(self, interaction: discord.Interaction, button):
+        await self.finish(interaction, "Hayır")
+
+    async def finish(self, interaction, teknoloji):
         await interaction.response.defer()
 
-    @discord.ui.button(label="Sözel", style=discord.ButtonStyle.primary)
-    async def sozel(self, interaction, button):
-        self.value = "sozel"
-        self.stop()
-        await interaction.response.defer()
+        data = user_answers.get(interaction.user.id)
+        if not data:
+            await interaction.followup.send("Oturum bulunamadı.")
+            return
 
+        data["teknoloji"] = teknoloji
 
-class EvetHayirButon(discord.ui.View):
-    def __init__(self, user):
-        super().__init__(timeout=60)
-        self.user = user
-        self.value = None
+        prompt = f"""
+Kullanıcı bilgileri:
+Alan: {data['alan']}
+İlgi alanı: {data['ilgi']}
+Teknoloji ilgisi: {data['teknoloji']}
 
-    async def interaction_check(self, interaction):
-        return interaction.user == self.user
+Bu bilgilere göre kullanıcıya detaylı bir kariyer önerisi yap.
+Hangi mesleklerin uygun olduğunu ve nedenlerini açıkla.
+"""
 
-    @discord.ui.button(label="Evet", style=discord.ButtonStyle.primary)
-    async def evet(self, interaction, button):
-        self.value = "evet"
-        self.stop()
-        await interaction.response.defer()
+        ai_cevap = await ollama_sor(prompt)
 
-    @discord.ui.button(label="Hayır", style=discord.ButtonStyle.primary)
-    async def hayir(self, interaction, button):
-        self.value = "hayir"
-        self.stop()
-        await interaction.response.defer()
+        cursor.execute("SELECT meslek FROM meslekler ORDER BY RANDOM() LIMIT 1")
+        db_meslek = cursor.fetchone()[0]
 
+        await interaction.followup.send(
+            f"Yapay zeka kariyer önerisi:\n{ai_cevap}\n\nVeritabanı önerisi: {db_meslek}"
+        )
+
+        user_answers.pop(interaction.user.id, None)
 
 @bot.command()
 async def kariyer(ctx):
-    user = ctx.author
-
-    await ctx.send("Kariyer formu başlıyor.")
-
-    await ctx.send("Yaşın kaç?")
-    yas_msg = await bot.wait_for("message", check=lambda m: m.author == user)
-    yas = yas_msg.content
-
-    view1 = AlanButon(user)
-    msg = await ctx.send("Hangi alandasın?", view=view1)
-    await view1.wait()
-    alan = view1.value
-
-    await msg.edit(content="En çok neyle ilgileniyorsun?", view=None)
-    ilgi_msg = await bot.wait_for("message", check=lambda m: m.author == user)
-    ilgi = ilgi_msg.content
-
-    view2 = EvetHayirButon(user)
-    msg2 = await ctx.send("Teknolojiye ilgin var mı?", view=view2)
-    await view2.wait()
-    teknoloji = view2.value
-
-    sonuc = meslek_belirle(yas, alan, ilgi, teknoloji)
-
-    cursor.execute("""
-    INSERT INTO cevaplar (user_id, yas, alan, ilgi, teknoloji, sonuc)
-    VALUES (?, ?, ?, ?, ?, ?)
-    """, (user.id, yas, alan, ilgi, teknoloji, sonuc))
-    conn.commit()
-
-    await ctx.send(f"Sana uygun meslek: {sonuc}")
+    await ctx.send(
+        "Kariyer testini başlatmak için butona bas.",
+        view=StartView()
+    )
 
 bot.run(TOKEN)
